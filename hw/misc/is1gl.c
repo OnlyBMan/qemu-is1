@@ -549,6 +549,8 @@ static void is1gl_make_current(Is1glState *s, uint32_t id,
 {
     bool first = !s->share_root;
     bool inherit_projection = false;
+    GLboolean startup_blend = GL_FALSE;
+    GLint startup_blend_src = GL_ONE, startup_blend_dst = GL_ZERO;
     GLdouble projection[16];
     Is1glHostCtx *c;
 
@@ -564,9 +566,11 @@ static void is1gl_make_current(Is1glState *s, uint32_t id,
         /*
          * renderd initializes its window projection in the first context,
          * then renders in a second context sharing that same drawable. The
-         * old single-host-context replay happened to carry the projection
-         * across. Keep that one-time startup behavior while leaving texture
-         * bindings, enables, stacks, and all subsequent state per context.
+         * old single-host-context replay carried that projection and any
+         * startup blending across. Preserve both: without the blend state,
+         * transparent logo texels overwrite the background with black RGB.
+         * This applies only to the startup handoff; subsequent state,
+         * texture bindings, enables, and stacks stay per context.
          */
         if (!c->fbo && s->cur->ctx == s->share_root &&
             s->draw_w == w && s->draw_h == h) {
@@ -578,6 +582,11 @@ static void is1gl_make_current(Is1glState *s, uint32_t id,
                     inherit_projection = true;
                     break;
                 }
+            }
+            if (inherit_projection) {
+                startup_blend = glIsEnabled(GL_BLEND);
+                glGetIntegerv(GL_BLEND_SRC, &startup_blend_src);
+                glGetIntegerv(GL_BLEND_DST, &startup_blend_dst);
             }
         }
     }
@@ -655,6 +664,12 @@ static void is1gl_make_current(Is1glState *s, uint32_t id,
         glMatrixMode(GL_PROJECTION);
         glLoadMatrixd(projection);
         glMatrixMode(matrix_mode);
+        glBlendFunc(startup_blend_src, startup_blend_dst);
+        if (startup_blend) {
+            glEnable(GL_BLEND);
+        } else {
+            glDisable(GL_BLEND);
+        }
     }
     s->guest_ctx = id;
     s->context_switches++;

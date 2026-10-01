@@ -332,6 +332,177 @@ static void test_context_binding_isolation(void)
     test_context_frame(true, true, true, true);
 }
 
+static void test_context_alpha(bool renderer_blend, bool interleave_loader,
+                               bool bootstrap)
+{
+    QTestState *qts;
+    uint8_t records[IS1GL_RING_SIZE] = { 0 };
+    uint8_t texture[48] = { 0 };
+    uint8_t binding[8] = { 0 };
+    uint8_t parameter[12] = { 0 };
+    uint8_t blend[8];
+    uint8_t readback[36] = { 0 };
+    const uint8_t texels[16] = {
+        0, 0, 0, 0,         0, 0, 255, 255,
+        255, 0, 0, 128,     0, 255, 0, 255,
+    };
+    const uint8_t expected[4][3] = {
+        { 255, 255, 255 }, { 255, 0, 0 },
+        { 127, 127, 255 }, { 0, 255, 0 },
+    };
+    const uint8_t unblended[4][3] = {
+        { 0, 0, 0 }, { 255, 0, 0 },
+        { 0, 0, 255 }, { 0, 255, 0 },
+    };
+    const uint32_t samples[4][2] = {
+        { 1, 1 }, { 6, 1 }, { 1, 6 }, { 6, 6 },
+    };
+    const float projection[16] = {
+        0.25f, 0, 0, 0, 0, 0.25f, 0, 0,
+        0, 0, 1, 0, -1, -1, 0, 1,
+    };
+    const float white[4] = { 1, 1, 1, 1 };
+    size_t used = 0;
+    int i, component;
+
+    qts = qtest_init("-machine pc -nodefaults -display none "
+                     "-device is1gl,mmio=0xfed10000,iobase=0x520");
+    qtest_writel(qts, IS1GL_MMIO + IS1GL_REG_APER_LO, IS1GL_FRAME_BASE);
+    qtest_writel(qts, IS1GL_MMIO + IS1GL_REG_APER_SZ, IS1GL_FRAME_SIZE);
+    qtest_writel(qts, IS1GL_MMIO + IS1GL_REG_RING_LO, IS1GL_RING_BASE);
+    qtest_writel(qts, IS1GL_MMIO + IS1GL_REG_RING_SZ, IS1GL_RING_SIZE);
+
+    put_make_current(records, 1, 8, 8);
+    used += IS1GL_RECORD_SIZE;
+    append_u32(records, &used, IS1GL_OP_glMatrixMode, 0x1701);
+    if (bootstrap) {
+        append_record(records, &used, IS1GL_OP_glMultMatrixf,
+                      projection, sizeof(projection));
+    }
+    append_u32(records, &used, IS1GL_OP_glMatrixMode, 0x1700);
+    stl_le_p(blend, 0x0302);     /* GL_SRC_ALPHA */
+    stl_le_p(blend + 4, 0x0303); /* GL_ONE_MINUS_SRC_ALPHA */
+    if (!renderer_blend) {
+        append_u32(records, &used, IS1GL_OP_glEnable, 0x0be2);
+        append_record(records, &used, IS1GL_OP_glBlendFunc,
+                      blend, sizeof(blend));
+    }
+    stl_le_p(binding, 0x0de1); /* GL_TEXTURE_2D */
+    stl_le_p(binding + 4, 1);
+    append_record(records, &used, IS1GL_OP_glBindTexture,
+                  binding, sizeof(binding));
+    stl_le_p(parameter, 0x0de1);
+    stl_le_p(parameter + 4, 0x2801); /* GL_TEXTURE_MIN_FILTER */
+    stl_le_p(parameter + 8, 0x2600); /* GL_NEAREST */
+    append_record(records, &used, IS1GL_OP_glTexParameteri,
+                  parameter, sizeof(parameter));
+    stl_le_p(parameter + 4, 0x2800); /* GL_TEXTURE_MAG_FILTER */
+    append_record(records, &used, IS1GL_OP_glTexParameteri,
+                  parameter, sizeof(parameter));
+    stl_le_p(texture, 0x0de1);
+    stl_le_p(texture + 8, 0x1908); /* internal GL_RGBA */
+    stl_le_p(texture + 12, 2);
+    stl_le_p(texture + 16, 2);
+    stl_le_p(texture + 24, 0x1908); /* format GL_RGBA */
+    stl_le_p(texture + 28, 0x1401); /* GL_UNSIGNED_BYTE */
+    memcpy(texture + 32, texels, sizeof(texels));
+    append_record(records, &used, IS1GL_OP_glTexImage2D,
+                  texture, sizeof(texture));
+
+    put_make_current(records + used, 2, 8, 8);
+    used += IS1GL_RECORD_SIZE;
+    if (!bootstrap) {
+        /* An independent context must retain the default disabled blending. */
+        append_u32(records, &used, IS1GL_OP_glMatrixMode, 0x1701);
+        append_record(records, &used, IS1GL_OP_glMultMatrixf,
+                      projection, sizeof(projection));
+        append_u32(records, &used, IS1GL_OP_glMatrixMode, 0x1700);
+    }
+    if (renderer_blend) {
+        append_u32(records, &used, IS1GL_OP_glEnable, 0x0be2);
+        append_record(records, &used, IS1GL_OP_glBlendFunc,
+                      blend, sizeof(blend));
+    }
+    append_record(records, &used, IS1GL_OP_glClearColor, white, sizeof(white));
+    append_u32(records, &used, IS1GL_OP_glClear, 0x4000);
+    append_record(records, &used, IS1GL_OP_glColor4f, white, sizeof(white));
+    append_u32(records, &used, IS1GL_OP_glEnable, 0x0de1);
+    append_record(records, &used, IS1GL_OP_glBindTexture,
+                  binding, sizeof(binding));
+    if (interleave_loader) {
+        /* Later loader changes must not overwrite the renderer's blending. */
+        put_make_current(records + used, 1, 8, 8);
+        used += IS1GL_RECORD_SIZE;
+        append_u32(records, &used, IS1GL_OP_glDisable, 0x0be2);
+        stl_le_p(blend, 1);     /* GL_ONE */
+        stl_le_p(blend + 4, 0); /* GL_ZERO */
+        append_record(records, &used, IS1GL_OP_glBlendFunc,
+                      blend, sizeof(blend));
+        put_make_current(records + used, 2, 8, 8);
+        used += IS1GL_RECORD_SIZE;
+    }
+    append_u32(records, &used, IS1GL_OP_glBegin, 0x0007);
+    append_texcoord(records, &used, 0, 0);
+    append_vertex(records, &used, 0, 0);
+    append_texcoord(records, &used, 1, 0);
+    append_vertex(records, &used, 8, 0);
+    append_texcoord(records, &used, 1, 1);
+    append_vertex(records, &used, 8, 8);
+    append_texcoord(records, &used, 0, 1);
+    append_vertex(records, &used, 0, 8);
+    append_record(records, &used, IS1GL_OP_glEnd, NULL, 0);
+    stl_le_p(readback + 8, 8);
+    stl_le_p(readback + 12, 8);
+    stl_le_p(readback + 16, 0x80e1); /* GL_BGRA */
+    stl_le_p(readback + 20, 0x8367); /* GL_UNSIGNED_INT_8_8_8_8_REV */
+    stl_le_p(readback + 24, IS1GL_FRAME_BASE);
+    stl_le_p(readback + 28, 8);
+    append_record(records, &used, IS1GL_OP_READPIXELS,
+                  readback, sizeof(readback));
+    append_u32(records, &used, IS1GL_OP_FENCE, 1);
+    qtest_memwrite(qts, IS1GL_RING_BASE + IS1GL_RING_HDR, records, used);
+    qtest_writel(qts, IS1GL_MMIO + IS1GL_REG_DOORBELL, used);
+    for (i = 0; i < 100 &&
+         qtest_readl(qts, IS1GL_MMIO + IS1GL_REG_DONE_SEQ) != 1; i++) {
+        g_usleep(10000);
+    }
+    g_assert_cmpuint(qtest_readl(qts, IS1GL_MMIO + IS1GL_REG_DONE_SEQ), ==, 1);
+    for (i = 0; i < G_N_ELEMENTS(samples); i++) {
+        uint8_t pixel[4];
+
+        qtest_memread(qts, IS1GL_FRAME_BASE +
+                      (samples[i][1] * 8 + samples[i][0]) * 4,
+                      pixel, sizeof(pixel));
+        for (component = 0; component < 3; component++) {
+            uint8_t value = bootstrap ? expected[i][component] :
+                                       unblended[i][component];
+
+            g_assert_cmpuint(pixel[component], ==, value);
+        }
+    }
+    qtest_quit(qts);
+}
+
+static void test_context_alpha_explicit(void)
+{
+    test_context_alpha(true, false, true);
+}
+
+static void test_context_alpha_handoff(void)
+{
+    test_context_alpha(false, false, true);
+}
+
+static void test_context_alpha_isolation(void)
+{
+    test_context_alpha(false, true, true);
+}
+
+static void test_context_alpha_no_handoff(void)
+{
+    test_context_alpha(false, false, false);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -345,5 +516,12 @@ int main(int argc, char **argv)
                    test_context_projection_handoff);
     qtest_add_func("/is1gl/context-binding-isolation",
                    test_context_binding_isolation);
+    qtest_add_func("/is1gl/context-alpha-explicit",
+                   test_context_alpha_explicit);
+    qtest_add_func("/is1gl/context-alpha-handoff", test_context_alpha_handoff);
+    qtest_add_func("/is1gl/context-alpha-isolation",
+                   test_context_alpha_isolation);
+    qtest_add_func("/is1gl/context-alpha-no-handoff",
+                   test_context_alpha_no_handoff);
     return g_test_run();
 }
